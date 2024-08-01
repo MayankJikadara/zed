@@ -1,6 +1,6 @@
 use crate::{
     humanize_token_count, prompts::generate_content_prompt, AssistantPanel, AssistantPanelEvent,
-    Hunk, ModelSelector, StreamingDiff,
+    Hunk, LineBasedStreamingDiff, ModelSelector,
 };
 use anyhow::{anyhow, Context as _, Result};
 use client::{telemetry::Telemetry, ErrorExt};
@@ -2274,7 +2274,8 @@ impl Codegen {
                             let diff = async {
                                 let chunks = StripInvalidSpans::new(chunks?);
                                 futures::pin_mut!(chunks);
-                                let mut diff = StreamingDiff::new(selected_text.to_string());
+                                let mut diff =
+                                    LineBasedStreamingDiff::new(selected_text.to_string());
 
                                 let mut new_text = String::new();
                                 let mut base_indent = None;

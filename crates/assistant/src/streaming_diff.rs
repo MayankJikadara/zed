@@ -3,6 +3,7 @@ use ordered_float::OrderedFloat;
 use std::{
     cmp,
     fmt::{self, Debug},
+    mem,
     ops::Range,
 };
 
@@ -69,6 +70,90 @@ pub enum Hunk {
     Insert { text: String },
     Remove { len: usize },
     Keep { len: usize },
+}
+
+pub struct LineBasedStreamingDiff {
+    old_lines: Vec<String>,
+    old_line_ix: usize,
+    new: String,
+    new_line_ix: usize,
+    remove_len: usize,
+    text_to_insert: String,
+}
+
+impl LineBasedStreamingDiff {
+    pub fn new(old: String) -> Self {
+        Self {
+            old_lines: old.split('\n').map(|line| line.to_owned()).collect(),
+            new: String::new(),
+            old_line_ix: 0,
+            new_line_ix: 0,
+            remove_len: 0,
+            text_to_insert: String::new(),
+        }
+    }
+
+    pub fn push_new(&mut self, text: &str) -> Vec<Hunk> {
+        self.new.extend(text.chars());
+        let mut hunks = Vec::new();
+        let mut new_lines = self.new[self.new_line_ix..].split('\n').collect::<Vec<_>>();
+        // last line may be incomplete
+        new_lines.pop();
+        let mut old_lines = self.old_lines[self.old_line_ix..].iter().fuse();
+
+        for new_line in new_lines {
+            let new_line_len = new_line.len();
+
+            match old_lines.next() {
+                Some(old_line) => {
+                    let old_line_len = old_line.len();
+
+                    if old_line.as_str() == new_line {
+                        hunks.push(Hunk::Remove {
+                            len: mem::take(&mut self.remove_len),
+                        });
+                        hunks.push(Hunk::Insert {
+                            text: mem::take(&mut self.text_to_insert),
+                        });
+                        hunks.push(Hunk::Keep { len: new_line_len });
+                    } else {
+                        self.remove_len += old_line_len + 1;
+                        self.text_to_insert.push_str(new_line);
+                        self.text_to_insert.push('\n');
+                    }
+
+                    self.old_line_ix += 1;
+                }
+                None => {
+                    self.text_to_insert.push_str(new_line);
+                    self.text_to_insert.push('\n');
+                }
+            }
+
+            self.new_line_ix += new_line_len + 1;
+        }
+
+        hunks
+    }
+
+    pub fn finish(mut self) -> Vec<Hunk> {
+        let mut hunks = Vec::new();
+
+        if self.remove_len > 0 {
+            hunks.push(Hunk::Remove {
+                len: self.remove_len + self.old_lines[self.old_line_ix..].len(),
+            });
+        }
+
+        self.text_to_insert.push_str(&self.new[self.new_line_ix..]);
+        if !self.text_to_insert.is_empty() {
+            hunks.push(Hunk::Insert {
+                text: self.text_to_insert,
+            });
+        }
+
+        hunks
+    }
 }
 
 pub struct StreamingDiff {
@@ -245,6 +330,65 @@ mod tests {
         log::info!("old text: {:?}", old);
 
         let mut diff = StreamingDiff::new(old.clone());
+        let mut hunks = Vec::new();
+        let mut new_len = 0;
+        let mut new = String::new();
+        while new_len < new_text_len {
+            let new_chunk_len = rng.gen_range(1..=new_text_len - new_len);
+            let new_chunk = util::RandomCharIter::new(&mut rng)
+                .take(new_len)
+                .collect::<String>();
+            log::info!("new chunk: {:?}", new_chunk);
+            new_len += new_chunk_len;
+            new.push_str(&new_chunk);
+            let new_hunks = diff.push_new(&new_chunk);
+            log::info!("hunks: {:?}", new_hunks);
+            hunks.extend(new_hunks);
+        }
+        let final_hunks = diff.finish();
+        log::info!("final hunks: {:?}", final_hunks);
+        hunks.extend(final_hunks);
+
+        log::info!("new text: {:?}", new);
+        let mut old_ix = 0;
+        let mut new_ix = 0;
+        let mut patched = String::new();
+        for hunk in hunks {
+            match hunk {
+                Hunk::Keep { len } => {
+                    assert_eq!(&old[old_ix..old_ix + len], &new[new_ix..new_ix + len]);
+                    patched.push_str(&old[old_ix..old_ix + len]);
+                    old_ix += len;
+                    new_ix += len;
+                }
+                Hunk::Remove { len } => {
+                    old_ix += len;
+                }
+                Hunk::Insert { text } => {
+                    assert_eq!(text, &new[new_ix..new_ix + text.len()]);
+                    patched.push_str(&text);
+                    new_ix += text.len();
+                }
+            }
+        }
+        assert_eq!(patched, new);
+    }
+
+    #[gpui::test(iterations = 100)]
+    fn test_random_diffs_for_line_based_streaming_diff(mut rng: StdRng) {
+        let old_text_len = env::var("OLD_TEXT_LEN")
+            .map(|i| i.parse().expect("invalid `OLD_TEXT_LEN` variable"))
+            .unwrap_or(10);
+        let new_text_len = env::var("NEW_TEXT_LEN")
+            .map(|i| i.parse().expect("invalid `NEW_TEXT_LEN` variable"))
+            .unwrap_or(10);
+
+        let old = util::RandomCharIter::new(&mut rng)
+            .take(old_text_len)
+            .collect::<String>();
+        log::info!("old text: {:?}", old);
+
+        let mut diff = LineBasedStreamingDiff::new(old.clone());
         let mut hunks = Vec::new();
         let mut new_len = 0;
         let mut new = String::new();
